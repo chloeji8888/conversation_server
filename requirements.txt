@@ -96,3 +96,5 @@ pymysql
 DBUtils==3.0.3
 protobuf<6.0.0,>=4.25.0
 gunicorn==21.2.0
+beautifulsoup4==4.13.0
+fastmcp==0.0.1

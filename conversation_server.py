@@ -1,36 +1,27 @@
 import json
 from typing import Any
-from openai import OpenAI
-# from langchain_core.messages import HumanMessage
-# from langchain_openai import ChatOpenAI
+import aiohttp
+import asyncio
 from mcp.server.fastmcp import FastMCP
+from mcp.server.sse import SseServerTransport
 
 # Import your existing modules (adjust the import path as needed)
-from module.memory_manager import MemoryManager
-from module.handlers import TechnicalSupport
+
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
 
-#setup openai
-openai = OpenAI()
-
-# Set OpenAI API key from environment variable
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-
-# Initialize FastMCP server
+# Initialize FastMCP server with SSE transport
 mcp = FastMCP("conversation_server")
 
-# Create global instances of the handlers
-memory_manager = MemoryManager()
-tech_support = TechnicalSupport()
+# Dictionary to store pending tasks and their results
+pending_requests = {}
 
 @mcp.tool()
 async def process_conversation_turn(user_id: str, prompt: str) -> str:
     """
-    Process a conversation turn for a user.
+    Process a conversation turn for a user by calling an external API.
 
     Args:
         user_id: Unique identifier for the user
@@ -39,143 +30,109 @@ async def process_conversation_turn(user_id: str, prompt: str) -> str:
     Returns:
         A string containing the assistant's response
     """
-    # Retrieve conversation history using the global memory_manager
-    previous_messages = memory_manager.get_chat_history(user_id)
-    chat_history = [
-        {"role": msg["role"], "content": msg["content"]}
-        for msg in previous_messages
-    ]
-
-    # Classify the prompt: casual chat or technical query
-    classify_prompt = f"""
-        请判断以下用户输入是否为闲聊内容。
-        如果是闲聊内容（如问候、日常对话等），返回"True"。
-        如果是业务相关内容（如包装、设备、技术支持等），返回"False"。
-
-        用户输入: {prompt}
-
-        仅返回"True"或"False"，不要包含其他内容。
-    """
-    # Use direct OpenAI API call instead of LangChain
-    classify_response = openai.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.3,
-        messages=[{"role": "user", "content": classify_prompt}]
+    
+    # Start a background task to handle the API request
+    task_id = f"{user_id}_{asyncio.get_event_loop().time()}"
+    
+    # Create the background task
+    background_task = asyncio.create_task(
+        process_api_request(prompt)
     )
-    is_casual_chat = classify_response.choices[0].message.content.strip() == "True"
+    
+    # Store the task
+    pending_requests[task_id] = {
+        "task": background_task,
+        "result": None,
+        "completed": False
+    }
+    
+    # Return an immediate response that the request is being processed
+    return f"Your request is being processed. Please check back in a moment with 'status:{task_id}'"
 
-    if is_casual_chat:
-        # Handle casual chat with a friendly LLM response
-        chat_prompt = f"""
-        【系统角色】
-        你是一名专业的企业知识助理助手。负责根据提供的内部参考资料，以清晰准确的方式回答
-        员工问题。你的身份是 "广州标际包装设备有限公司" 的 AI 助手，回答全部体现专业性和
-        权威性。
-
-        【回答规则】
-        1. 语言要求:
-           - 使用专业规范的化表达 (根据用户身份动态调整)
-           - 保持对话自然、亲切、专业
-           - 复杂问题采用层级分解
-
-        user:
-        请以友好的方式回答用户的问题，保持对话自然、亲切、专业。
-        用户输入：{prompt}
-        """
-        # Use direct OpenAI API call instead of LangChain
-        response_message = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.3,
-            messages=[{"role": "user", "content": chat_prompt}]
-        )
-        response = response_message.choices[0].message.content
-    else:
-        # Handle technical query with RAG using the global tech_support instance
-        retriever = tech_support.retriever
-        retrieved_docs = retriever.invoke({"input": prompt, "chat_history": chat_history})
-        reference_text = ""
-        for i, doc in enumerate(retrieved_docs, 1):
-            reference_text += f"文档 {i}:\n内容: {doc.page_content}\n元数据: {doc.metadata}\n\n"
-
-        technical_response = tech_support.query(prompt, chat_history)
-
-        # Format the technical response
-        formatting_prompt = f"""
-        请将以下技术回答转换为更友好、专业的格式，遵循以下规则：
-            1. 严格分级响应:
-            - 当内容明确匹配知识库内容时:
-                ① 直接引用原文条款 (标注来源章节)
-                ② 用专业语言解释条款
-                ③ 举例说明（如适用）
-            - 当需要跨章节综合时:
-                ① 先说明"根据多个相关条款"
-                ② 分点列出不同条款要求
-                ③ 指出条款间的关联关系
-            - 当问题涉及边缘案例时:
-                ① 说明"可能知识库未覆盖此问题"
-                ② 提供最相关的3个已有条款
-                ③ 建议咨询部门负责人 (给出联系方式)
-
-            2. 语言要求:
-            - 使用专业规范的化表达 (根据用户身份动态调整)
-            - 关键数据必须精确引用且回应(精度要求)
-            - 复杂问题采用层级分解 (使用"第一步、第二步"句式)
-
-            3. 安全限制:
-            - 涉及【新版】【权限】等敏感话题时:
-                ① 先验证用户身份 (要求工号后四位)
-                ② 通过验证后仅提供该员工权限范围内的信息
-            - 遇到【敏感性检索】时:
-                ① 说明"根据保密条款"
-                ② 指出可能的变通路径
-                ③ 建议联系系统部门
-
-          【知识库说明】
-            可用可参考的权威资料:
-            <知识库>
-            {reference_text}
-            </知识库>
-
-            【输出格式】
-            "回答": "核心回答内容",
-            "0-1置信度评分": "0-1置信度评分",
-            "相关问题": ["相关延伸问题1", "问题2"]
-
-        技术回答：
-        {technical_response}
-
-        请以如下格式输出：
-        {{
-            "回答": "转换后的回答内容",
-            "0-1置信度评分": "基于回答准确度的评分",
-            "相关问题": ["相关延伸问题1", "相关延伸问题2", "相关延伸问题3"]
-        }}
-        """
-        formatted_response_message = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.3,
-            messages=[{"role": "user", "content": formatting_prompt}]
-        )
-        formatted_response = formatted_response_message.choices[0].message.content
-
+@mcp.tool()
+async def check_request_status(task_id: str) -> str:
+    """
+    Check the status of a previously submitted conversation request.
+    
+    Args:
+        task_id: The ID of the background task to check
+        
+    Returns:
+        The assistant's response if ready, or a status message
+    """
+    if task_id not in pending_requests:
+        return "Request not found. Please submit a new query."
+    
+    request_info = pending_requests[task_id]
+    
+    if request_info["completed"]:
+        # Return the stored result and clean up
+        result = request_info["result"]
+        del pending_requests[task_id]
+        return result
+    
+    # Check if the task is done
+    if request_info["task"].done():
         try:
-            response_dict = json.loads(formatted_response)
-            response = (
-                f"回答：{response_dict['回答']}\n\n"
-                f"置信度：{response_dict['0-1置信度评分']}\n\n"
-                f"相关问题：\n"
-                f"- {response_dict['相关问题'][0]}\n"
-                f"- {response_dict['相关问题'][1]}\n"
-                f"- {response_dict['相关问题'][2]}"
-            )
-        except json.JSONDecodeError:
-            response = formatted_response  # Fallback to raw response if JSON parsing fails
+            # Get the result
+            result = request_info["task"].result()
+            request_info["result"] = result
+            request_info["completed"] = True
+            return result
+        except Exception as e:
+            request_info["result"] = f"Error processing request: {str(e)}"
+            request_info["completed"] = True
+            return request_info["result"]
+    
+    # Task is still running
+    return "Your request is still being processed. Please check back in a moment."
 
-    # Save the conversation turn to memory using the global memory_manager
-    memory_manager.save_chat_message(user_id, "user", prompt)
-    memory_manager.save_chat_message(user_id, "assistant", response)
-
-    return response
+async def process_api_request(prompt: str) -> str:
+    """
+    Process the API request in the background.
+    """
+    # API endpoint and headers
+    url = "http://localhost:9020/api/v1/chat"
+    headers = {
+        "GBPI-API-Key": "gbpi_k4raTP9oHEAALEpUkKlUxkD2suzqM4NIZGGRpKxTufM",
+        "Content-Type": "application/json"
+    }
+    
+    # Prepare payload
+    payload = {
+        "prompt": prompt,
+        "context": {}
+    }
+    
+    # Process the API request
+    try:
+        # Create a simple session for the API call with a very generous timeout
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=300)  # 5 minutes timeout
+            ) as response:
+                if response.status != 200:
+                    text = await response.text()
+                    assistant_response = f"Error from API: Status {response.status}, {text}"
+                else:
+                    result = await response.json()
+                    # Extract the assistant's response from the result
+                    assistant_response = result.get("response", "")
+        
+    except asyncio.TimeoutError:
+        assistant_response = "Request timed out. Please try again later."
+    except aiohttp.ClientError as e:
+        assistant_response = f"Error calling the chat API: {str(e)}"
+    except Exception as e:
+        # Catch any other unexpected errors
+        assistant_response = f"Unexpected error: {str(e)}"
+    
+    
+    return assistant_response
 
 if __name__ == "__main__":
+    # Use stdio transport instead to rule out transport issues
     mcp.run(transport='stdio')
