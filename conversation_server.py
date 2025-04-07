@@ -4,6 +4,10 @@ import aiohttp
 import asyncio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
+import uvicorn
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.requests import Request
 
 # Import your existing modules (adjust the import path as needed)
 
@@ -112,7 +116,7 @@ async def process_api_request(prompt: str) -> str:
                 url,
                 headers=headers,
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=300)  # 5 minutes timeout
+                timeout=aiohttp.ClientTimeout(total=30) # 30 seconds timeout
             ) as response:
                 if response.status != 200:
                     text = await response.text()
@@ -133,6 +137,29 @@ async def process_api_request(prompt: str) -> str:
     
     return assistant_response
 
+# Set up the SSE transport for MCP communication.
+sse = SseServerTransport("/messages/")
+
+async def handle_sse(request: Request) -> None:
+    _server = mcp._mcp_server
+    async with sse.connect_sse(
+        request.scope,
+        request.receive,
+        request._send,
+    ) as (reader, writer):
+        await _server.run(reader, writer, _server.create_initialization_options())
+
+# Create the Starlette app with two endpoints:
+# - "/sse": for SSE connections from clients.
+# - "/messages/": for handling incoming POST messages.
+app = Starlette(
+    debug=True,
+    routes=[
+        Route("/sse", endpoint=handle_sse),
+        Mount("/messages/", app=sse.handle_post_message),
+    ],
+)
+
 if __name__ == "__main__":
     # Use stdio transport instead to rule out transport issues
-    mcp.run(transport='stdio')
+    uvicorn.run(app, host="0.0.0.0", port=8000)
