@@ -8,3 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+.env
+
+# Ignore all files in the data directory
+data/*
+
+# Ignore all files in the logs directory
+logs/*
